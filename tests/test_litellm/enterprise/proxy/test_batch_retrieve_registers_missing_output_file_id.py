@@ -3,6 +3,7 @@
 import base64
 import json
 from types import SimpleNamespace
+from typing import Final
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -107,6 +108,83 @@ async def test_ensure_batch_response_registers_output_and_error_file_ids():
     ]
     assert {"my-model": "file-raw-output"} in mappings
     assert {"my-model": "file-raw-error"} in mappings
+
+
+@pytest.mark.asyncio
+async def test_get_batch_from_database_wraps_nested_proxy_file_ids():
+    inner_output_file_id: Final = (
+        base64.urlsafe_b64encode(
+            b"litellm_proxy:application/json;unified_id,inner-file;"
+            b"target_model_names,openai/gpt-5.5;"
+            b"llm_output_file_id,file-provider-output;"
+            b"llm_output_file_model_id,inner-proxy-deployment"
+        )
+        .decode()
+        .rstrip("=")
+    )
+    inner_error_file_id: Final = (
+        base64.urlsafe_b64encode(
+            b"litellm_proxy:application/json;unified_id,inner-error;"
+            b"target_model_names,openai/gpt-5.5;"
+            b"llm_output_file_id,file-provider-error;"
+            b"llm_output_file_model_id,inner-proxy-deployment"
+        )
+        .decode()
+        .rstrip("=")
+    )
+    outer_output_file_id: Final = "file-outer-output"
+    outer_error_file_id: Final = "file-outer-error"
+    batch_data: Final = {
+        "id": "batch-raw-123",
+        "completion_window": "24h",
+        "created_at": 1700000000,
+        "endpoint": "/v1/chat/completions",
+        "input_file_id": "file-input-raw",
+        "object": "batch",
+        "status": "completed",
+        "output_file_id": inner_output_file_id,
+        "error_file_id": inner_error_file_id,
+    }
+    batch_db_record: Final = SimpleNamespace(
+        file_object=json.dumps(batch_data),
+        created_by="batch-owner",
+        team_id=None,
+        status="complete",
+    )
+    prisma: Final = MagicMock()
+    prisma.db.litellm_managedobjecttable.find_first = AsyncMock(return_value=batch_db_record)
+    prisma.db.litellm_managedfiletable.find_first = AsyncMock(return_value=None)
+    mock_managed_files: Final = _build_managed_files_mock()
+    mock_managed_files.get_unified_output_file_id.side_effect = [
+        outer_output_file_id,
+        outer_error_file_id,
+    ]
+
+    database_result: Final = await get_batch_from_database(
+        batch_id=ENCODED_UNIFIED_BATCH_ID,
+        unified_batch_id=UNIFIED_BATCH_ID,
+        managed_files_obj=mock_managed_files,
+        prisma_client=prisma,
+        verbose_proxy_logger=MagicMock(),
+    )
+    response: Final = database_result[1]
+
+    assert response is not None
+    assert response.output_file_id == outer_output_file_id
+    assert response.error_file_id == outer_error_file_id
+    assert [call.kwargs["output_file_id"] for call in mock_managed_files.get_unified_output_file_id.call_args_list] == [
+        inner_output_file_id,
+        inner_error_file_id,
+    ]
+    assert [call.kwargs["model_mappings"] for call in mock_managed_files.store_unified_file_id.await_args_list] == [
+        {"my-model": inner_output_file_id},
+        {"my-model": inner_error_file_id},
+    ]
+    assert {
+        call.kwargs["model_id"] for call in mock_managed_files.get_unified_output_file_id.call_args_list
+    } == {
+        "my-model"
+    }
 
 
 @pytest.mark.asyncio

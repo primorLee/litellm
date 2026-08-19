@@ -6,6 +6,7 @@ Vertex (raw gs:// input_file_id) and Bedrock (raw s3:// input_file_id,
 ARN unified_object_id) batches with no managed unified id.
 """
 
+from typing import Final
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -2189,6 +2190,126 @@ class TestManagedOutputFileIdEncodesPublicModelGroup:
 
         decoded = _is_base64_encoded_unified_file_id(output_file_id)
         assert get_models_from_unified_file_id(decoded) == [self._PUBLIC_MODEL_GROUP]
+
+
+class TestChainedProxyBatchCost:
+    @pytest.mark.asyncio
+    async def test_keeps_inner_proxy_file_ids_as_the_next_hop(self):
+        from litellm.proxy.openai_files_endpoints.common_utils import (
+            _is_base64_encoded_unified_file_id,
+            get_model_id_from_unified_output_file_id,
+        )
+        from litellm.types.utils import LiteLLMBatch
+        from litellm_enterprise.proxy.common_utils.check_batch_cost import (
+            CheckBatchCost,
+        )
+        from litellm_enterprise.proxy.hooks.managed_files import (
+            _PROXY_LiteLLMManagedFiles,
+        )
+
+        outer_model_id: Final = "outer-proxy-deployment"
+        inner_output_file_id: Final = _PROXY_LiteLLMManagedFiles.get_unified_output_file_id(
+            None,
+            output_file_id="file-provider-output",
+            model_id="inner-proxy-deployment",
+            model_name="gpt-5.6-batch",
+        )
+        response: Final = LiteLLMBatch(
+            id="batch-provider-id",
+            completion_window="24h",
+            created_at=1,
+            endpoint="/v1/chat/completions",
+            input_file_id="file-provider-input",
+            object="batch",
+            status="completed",
+            output_file_id=inner_output_file_id,
+        )
+        job: Final = MagicMock()
+        job.unified_object_id = "batch-outer-unified"
+        job.created_by = "batch-owner"
+        job.team_id = None
+        job.api_key = None
+        job.request_tags = None
+        job.file_object = response.model_dump_json()
+
+        credentials: Final = {
+            "api_key": "test-proxy-key",
+            "api_base": "http://proxy-b:4000",
+            "custom_llm_provider": "litellm_proxy",
+        }
+        router: Final = MagicMock()
+        router.get_deployment_credentials_with_provider = MagicMock(return_value=credentials)
+        deployment: Final = MagicMock()
+        deployment.litellm_params.custom_llm_provider = "litellm_proxy"
+        deployment.litellm_params.model = "litellm_proxy/gpt-5.6-batch"
+        deployment.model_name = "gpt-5.6-batch"
+        deployment.model_info.model_dump.return_value = {}
+        router.get_deployment = MagicMock(return_value=deployment)
+
+        managed_files_hook: Final = MagicMock()
+        managed_files_hook.get_unified_output_file_id.side_effect = lambda output_file_id, model_id, model_name: (
+            _PROXY_LiteLLMManagedFiles.get_unified_output_file_id(
+                None,
+                output_file_id=output_file_id,
+                model_id=model_id,
+                model_name=model_name,
+            )
+        )
+        managed_files_hook.store_unified_file_id = AsyncMock()
+        proxy_logging_obj: Final = MagicMock()
+        proxy_logging_obj.get_proxy_hook.return_value = managed_files_hook
+        prisma_client: Final = MagicMock()
+        prisma_client.db.litellm_usertable.find_unique = AsyncMock(return_value=None)
+        checker: Final = CheckBatchCost(
+            proxy_logging_obj=proxy_logging_obj,
+            prisma_client=prisma_client,
+            llm_router=router,
+        )
+        file_content: Final = MagicMock(content=b'{"id":"req-1"}')
+
+        with (
+            patch(
+                "litellm.files.main.afile_content",
+                new_callable=AsyncMock,
+                return_value=file_content,
+            ) as mock_afile_content,
+            patch(
+                "litellm.batches.batch_utils._get_file_content_as_dictionary",
+                return_value=[{"id": "req-1"}],
+            ),
+            patch(
+                "litellm.batches.batch_utils.calculate_batch_cost_and_usage",
+                new_callable=AsyncMock,
+                return_value=(0.01, {"prompt_tokens": 10}, ["gpt-5.5"]),
+            ),
+            patch(
+                "litellm.litellm_core_utils.get_llm_provider_logic.get_llm_provider",
+                return_value=("gpt-5.6-batch", "litellm_proxy", None, None),
+            ),
+            patch("litellm.litellm_core_utils.litellm_logging.Logging") as logging_cls,
+        ):
+            logging_obj: Final = MagicMock()
+            logging_obj.async_success_handler = AsyncMock()
+            logging_cls.return_value = logging_obj
+
+            await checker._track_completed_batch_cost(
+                job=job,
+                response=response,
+                model_id=outer_model_id,
+                batch_id="batch-provider-id",
+                prom_logger=None,
+            )
+
+        mock_afile_content.assert_awaited_once()
+        assert mock_afile_content.await_args.kwargs["file_id"] == inner_output_file_id
+        decoded_output_file_id: Final = _is_base64_encoded_unified_file_id(response.output_file_id)
+        assert get_model_id_from_unified_output_file_id(decoded_output_file_id) == outer_model_id
+        managed_files_hook.store_unified_file_id.assert_awaited_once()
+        assert managed_files_hook.store_unified_file_id.await_args.kwargs["model_mappings"] == {
+            outer_model_id: inner_output_file_id
+        }
+
+
 class TestBatchCostAttribution:
     """CheckBatchCost rebuilds the creator's spend metadata from the managed-object row so
     the batch-cost log is attributed like a non-batch request."""

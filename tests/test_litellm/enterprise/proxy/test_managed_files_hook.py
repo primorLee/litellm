@@ -11,7 +11,7 @@ import json
 import logging
 
 import pytest
-from typing import Optional
+from typing import Final, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from litellm.proxy._types import UserAPIKeyAuth
@@ -318,6 +318,57 @@ async def test_should_not_double_wrap_already_unified_output_file_id():
         already_unified + "=" * (-len(already_unified) % 4)
     ).decode()
     assert decoded.count(f"llm_output_file_id,{provider_file_id}") == 1
+
+
+@pytest.mark.asyncio
+async def test_chained_proxy_wraps_nested_output_file_id_for_front_deployment():
+    managed_files: Final = _make_managed_files_instance()
+    inner_provider_file_id: Final = "file-provider-output"
+    inner_unified_file_id: Final = managed_files.get_unified_output_file_id(
+        output_file_id=inner_provider_file_id,
+        model_id="inner-proxy-deployment",
+        model_name="openai/gpt-5.5",
+    )
+    outer_model_id: Final = "outer-proxy-deployment"
+    outer_model_name: Final = "litellm_proxy/gpt-5.5-batch"
+    batch_response: Final = _make_batch_response(
+        model_id=outer_model_id,
+        model_name=outer_model_name,
+        output_file_id=inner_unified_file_id,
+    )
+
+    mock_router: Final = MagicMock()
+    mock_router.get_deployment_credentials_with_provider = MagicMock(
+        return_value={
+            "api_key": "test-proxy-key",
+            "api_base": "http://proxy-b:4000",
+            "custom_llm_provider": "litellm_proxy",
+        }
+    )
+    mock_afile_retrieve: Final = AsyncMock(return_value=_make_file_object(inner_provider_file_id))
+
+    with (
+        patch("litellm.afile_retrieve", mock_afile_retrieve),
+        patch("litellm.proxy.proxy_server.llm_router", mock_router),
+    ):
+        await managed_files.async_post_call_success_hook(
+            data={},
+            user_api_key_dict=_make_user_api_key_dict(),
+            response=batch_response,
+        )
+
+    expected_outer_file_id: Final = managed_files.get_unified_output_file_id(
+        output_file_id=inner_unified_file_id,
+        model_id=outer_model_id,
+        model_name=outer_model_name,
+    )
+    assert batch_response.output_file_id == expected_outer_file_id
+    mock_afile_retrieve.assert_awaited_once()
+    assert mock_afile_retrieve.await_args.kwargs["file_id"] == inner_unified_file_id
+    managed_files.store_unified_file_id.assert_awaited_once()
+    assert managed_files.store_unified_file_id.await_args.kwargs["model_mappings"] == {
+        outer_model_id: inner_unified_file_id
+    }
 
 
 @pytest.mark.asyncio

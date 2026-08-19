@@ -51,6 +51,7 @@ from litellm.proxy.openai_files_endpoints.common_utils import (
     get_batch_id_from_unified_batch_id,
     get_content_type_from_file_object,
     get_model_id_from_unified_batch_id,
+    get_model_id_from_unified_output_file_id,
     map_raw_file_ids_to_unified,
     normalize_mime_type_for_provider,
     resolve_managed_output_file_model_name,
@@ -1182,8 +1183,17 @@ class _PROXY_LiteLLMManagedFiles(CustomLogger, BaseFileEndpoints):
                     if file_id_value and model_id:
                         decoded_output_file_id = _is_base64_encoded_unified_file_id(file_id_value)
                         if decoded_output_file_id and "llm_output_file_id," in decoded_output_file_id:
-                            provider_file_id = self.get_output_file_id_from_unified_file_id(decoded_output_file_id)
-                            unified_file_id = file_id_value
+                            if get_model_id_from_unified_output_file_id(decoded_output_file_id) == model_id:
+                                provider_file_id = self.get_output_file_id_from_unified_file_id(decoded_output_file_id)
+                                unified_file_id = file_id_value
+                            else:
+                                provider_file_id = file_id_value
+                                unified_file_id = self.get_unified_output_file_id(
+                                    output_file_id=provider_file_id,
+                                    model_id=model_id,
+                                    model_name=resolved_model_name,
+                                )
+                                setattr(response, file_attr, unified_file_id)
                         elif decoded_output_file_id:
                             verbose_logger.warning(
                                 f"Skipping {file_attr}={file_id_value!r}: unified id is not a managed file output id"

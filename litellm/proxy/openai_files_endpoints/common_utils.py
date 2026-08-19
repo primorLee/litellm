@@ -110,6 +110,24 @@ def get_model_id_from_unified_batch_id(file_id: str) -> str | None:
         return None
 
 
+def get_model_id_from_unified_output_file_id(file_id: str) -> str | None:
+    marker: Final = "llm_output_file_model_id,"
+    if marker not in file_id:
+        return None
+    model_id: Final = file_id.split(marker, 1)[1].split(";", 1)[0]
+    return model_id or None
+
+
+def should_rewrap_managed_output_file_id(file_id: str, model_id: str) -> bool:
+    decoded_file_id: Final = _is_base64_encoded_unified_file_id(file_id)
+    if not decoded_file_id:
+        return True
+    return (
+        "llm_output_file_id," in decoded_file_id
+        and get_model_id_from_unified_output_file_id(decoded_file_id) != model_id
+    )
+
+
 def get_batch_id_from_unified_batch_id(file_id: str) -> str:
     ## use regex to get the batch_id from the file_id
     # Ensure file_id is a string and not a mock object
@@ -1160,7 +1178,9 @@ async def ensure_batch_response_managed_file_ids(
 
     for file_attr in ("output_file_id", "error_file_id"):
         raw_file_id = getattr(response, file_attr, None)
-        if not raw_file_id or _is_base64_encoded_unified_file_id(raw_file_id):
+        if not raw_file_id:
+            continue
+        if not should_rewrap_managed_output_file_id(raw_file_id, model_id):
             continue
         try:
             new_unified_file_id = managed_files_obj.get_unified_output_file_id(

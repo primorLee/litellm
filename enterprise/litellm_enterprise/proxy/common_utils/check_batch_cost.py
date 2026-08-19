@@ -586,6 +586,8 @@ class CheckBatchCost:
         from litellm.litellm_core_utils.litellm_logging import deployment_pricing_model_info
         from litellm.proxy.openai_files_endpoints.common_utils import (
             _is_base64_encoded_unified_file_id,
+            get_model_id_from_unified_output_file_id,
+            should_rewrap_managed_output_file_id,
         )
 
         verbose_proxy_logger.info(
@@ -612,7 +614,7 @@ class CheckBatchCost:
         # provider file ID and call afile_content directly with deployment credentials.
         raw_output_file_id = response.output_file_id
         decoded = _is_base64_encoded_unified_file_id(raw_output_file_id)
-        if decoded:
+        if decoded and get_model_id_from_unified_output_file_id(decoded) == model_id:
             try:
                 raw_output_file_id = decoded.split("llm_output_file_id,")[1].split(";")[0]
             except (IndexError, AttributeError):
@@ -679,7 +681,7 @@ class CheckBatchCost:
             )
             for _file_attr in ["output_file_id", "error_file_id"]:
                 _raw_file_id = getattr(response, _file_attr, None)
-                if _raw_file_id and not _is_base64_encoded_unified_file_id(_raw_file_id):
+                if _raw_file_id and should_rewrap_managed_output_file_id(_raw_file_id, model_id):
                     try:
                         _unified_file_id = managed_files_hook.get_unified_output_file_id(
                             output_file_id=_raw_file_id,
